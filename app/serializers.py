@@ -45,23 +45,7 @@ class CardSerializer(serializers.ModelSerializer):
     class Meta:
         model = Card
         fields = ['id', 'account', 'card_num', 'balance']
-        read_only_fields = ['id', 'balance', 'card_num']
-    
-    def validate_account(self, value):
-        try:
-            account = Account.objects.get(id=value)
-        except Account.DoesNotExist:
-            raise serializers.ValidationError('Счет не существует')
-        return value
-    
-    def create(self, validated_data):
-        account = validated_data.get('account')
-        card = Card.objects.create(
-            account=account, 
-            card_num=secrets.token_urlsafe(16),
-            balance=account.balance
-        )
-        return card
+        read_only_fields = ['id', 'balance', 'card_num', 'account']
 
 
 class AccountSerializer(serializers.ModelSerializer):

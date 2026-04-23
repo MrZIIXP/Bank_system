@@ -7,7 +7,7 @@ from rest_framework.filters import OrderingFilter
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.serializers import ValidationError
 from django.utils import timezone
-
+import secrets
 from .models import Account, Card, Transactions, Deposite, Credit
 from .serializers import (
     RegisterSerializer, UserProfileSerializer,
@@ -16,7 +16,6 @@ from .serializers import (
 )
 
 
-# ============= AUTH VIEWS (не трогать) =============
 
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
@@ -42,10 +41,8 @@ class LogoutView(APIView):
             )
 
 
-# ============= PROFILE VIEWS =============
 
 class UserProfileView(generics.RetrieveUpdateAPIView):
-    """Просмотр и обновление профиля пользователя"""
     permission_classes = [IsAuthenticated]
     serializer_class = UserProfileSerializer
     
@@ -72,7 +69,6 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
         account = self.get_object()
         user = request.user
         
-        # Обновляем User
         if 'first_name' in request.data:
             user.first_name = request.data.get('first_name')
         if 'last_name' in request.data:
@@ -83,7 +79,6 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
             user.email = request.data.get('email')
         user.save()
         
-        # Обновляем Account
         if 'first_name' in request.data:
             account.first_name = request.data.get('first_name')
         if 'last_name' in request.data:
@@ -108,7 +103,6 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
 
 
 class AccountListCreateView(generics.ListCreateAPIView):
-    """Список счетов и создание нового счета"""
     serializer_class = AccountSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [OrderingFilter]
@@ -131,7 +125,6 @@ class AccountListCreateView(generics.ListCreateAPIView):
 
 
 class AccountDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """Просмотр, обновление и удаление счета"""
     serializer_class = AccountSerializer
     permission_classes = [IsAuthenticated]
     lookup_field = 'id'
@@ -142,7 +135,6 @@ class AccountDetailView(generics.RetrieveUpdateDestroyAPIView):
     def destroy(self, request, *args, **kwargs):
         account = self.get_object()
         
-        # Проверка наличия активных карт
         if account.cards.exists():
             return Response({
                 'error': 'Невозможно удалить счет с активными картами'
@@ -155,7 +147,6 @@ class AccountDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 class AccountTotalBalanceView(generics.GenericAPIView):
-    """Общий баланс всех счетов"""
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
@@ -216,7 +207,7 @@ class AccountTopUpView(generics.GenericAPIView):
 
 
 
-class CardListCreateView(generics.ListCreateAPIView):
+class CardListView(generics.ListAPIView):
     serializer_class = CardSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [OrderingFilter]
@@ -227,20 +218,6 @@ class CardListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         return Card.objects.filter(account__user=self.request.user)
     
-    def perform_create(self, serializer):
-        
-        try:
-            account = Account.objects.get(user=self.request.user)
-        except Account.DoesNotExist:
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({'account': 'Счет не найден или вы не владеете им'})
-        
-        if Card.objects.filter(account=account).count() >= 3:
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({'error': 'Нельзя выпустить более 3 карт на один счет'})
-        
-        serializer.save(account=account)
-    
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
@@ -248,6 +225,36 @@ class CardListCreateView(generics.ListCreateAPIView):
             'count': queryset.count(),
             'results': serializer.data
         }, status=status.HTTP_200_OK)
+
+
+class CardCreateView(generics.CreateAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = None
+
+    def create(self, request, *args, **kwargs):
+        try:
+            account = Account.objects.get(user=request.user)
+        except Account.DoesNotExist:
+            return Response(
+                {'error': 'У вас нет счета'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if Card.objects.filter(account=account).count() >= 3:
+            return Response(
+                {'error': 'Нельзя выпустить более 3 карт на один счет'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        card = Card.objects.create(
+            account=account,
+            card_num=secrets.token_urlsafe(16),
+            balance=account.balance
+        )
+        
+        serializer = self.get_serializer(card)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
 
 
 class CardDetailView(generics.RetrieveDestroyAPIView):
@@ -515,7 +522,7 @@ class CreditListCreateView(generics.ListCreateAPIView):
         }, status=status.HTTP_200_OK)
 
 
-class CreditDetailView(generics.RetrieveUpdateAPIView):
+class CreditDetailView(generics.RetrieveDestroyAPIView):
     serializer_class = CreditSerializer
     permission_classes = [IsAuthenticated]
     
