@@ -7,6 +7,7 @@ from rest_framework import generics, permissions, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from drf_yasg.utils import swagger_auto_schema
 
 from .models import (
     Account,
@@ -66,6 +67,7 @@ def set_blacklist_cache_for_card(card_id, in_blacklist):
 class AuthView(APIView):
     permission_classes = [permissions.AllowAny]
 
+    @swagger_auto_schema(request_body=AuthSerializer)
     def post(self, request):
         serializer = AuthSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -81,6 +83,7 @@ class AuthView(APIView):
 class VerifyView(APIView):
     permission_classes = [permissions.AllowAny]
 
+    @swagger_auto_schema(request_body=VerifySerializer)
     def post(self, request):
         serializer = VerifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -143,6 +146,7 @@ class AddCardView(generics.CreateAPIView):
 class CheckIfAccountExistsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @swagger_auto_schema(request_body=CheckExistsSerializer)
     def post(self, request):
         serializer = CheckExistsSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
