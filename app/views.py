@@ -1,649 +1,458 @@
-from rest_framework import generics, status, permissions
+from decimal import Decimal
+import random
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.db.models import Q
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
-from django.db.models import Q, Sum
-from rest_framework.filters import OrderingFilter
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework.serializers import ValidationError
-from django.utils import timezone
-import secrets
-from .models import Account, Card, Transactions, Deposite, Credit
+
+from .models import (
+    Account,
+    AccountBlackList,
+    Card,
+    CardBlackList,
+    Credit,
+    Deposit,
+    Transaction,
+    TransactionInside,
+)
 from .serializers import (
-    RegisterSerializer, UserProfileSerializer,
-    AccountSerializer, CardSerializer, TransactionSerializer, DepositeSerializer,
-    CreditSerializer
+    AccountBlackListSerializer,
+    AccountSerializer,
+    AuthSerializer,
+    CardBlackListSerializer,
+    CardSerializer,
+    CheckExistsSerializer,
+    CreditSerializer,
+    DepositSerializer,
+    TransactionInsideSerializer,
+    TransactionSerializer,
+    VerifySerializer,
 )
 
+User = get_user_model()
+
+OTP_TTL_SECONDS = 180
+EXISTS_TTL_SECONDS = 120
+HISTORY_TTL_SECONDS = 180
+BLACKLIST_TTL_SECONDS = 300
 
 
-class RegisterView(generics.CreateAPIView):
-    serializer_class = RegisterSerializer
+def history_cache_key(user_id, params):
+    version = cache.get(f"history:version:{user_id}", 1)
+    card = params.get("card", "")
+    income_and_pays = params.get("income_and_pays", "")
+    inside = params.get("inside", "")
+    time_filter = params.get("time", "")
+    return f"history:{user_id}:{version}:{card}:{income_and_pays}:{inside}:{time_filter}"
+
+
+def invalidate_history_cache(user_id):
+    version_key = f"history:version:{user_id}"
+    version = cache.get(version_key, 1)
+    cache.set(version_key, version + 1, HISTORY_TTL_SECONDS * 10)
+
+
+def set_blacklist_cache_for_account(account_id, in_blacklist):
+    cache.set(f"blacklist:account:{account_id}", in_blacklist, BLACKLIST_TTL_SECONDS)
+
+
+def set_blacklist_cache_for_card(card_id, in_blacklist):
+    cache.set(f"blacklist:card:{card_id}", in_blacklist, BLACKLIST_TTL_SECONDS)
+
+
+class AuthView(APIView):
     permission_classes = [permissions.AllowAny]
 
+    def post(self, request):
+        serializer = AuthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone_num = serializer.validated_data["phone_num"]
+        otp = f"{random.randint(0, 999999):06d}"
+        cache.set(f"otp:{phone_num}", otp, OTP_TTL_SECONDS)
+        return Response(
+            {"message": "OTP sent.", "phone_num": phone_num, "otp": otp},
+            status=status.HTTP_200_OK,
+        )
 
-class LogoutView(APIView):
+
+class VerifyView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = VerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        phone_num = data["phone_num"]
+        cached_otp = cache.get(f"otp:{phone_num}")
+        if not cached_otp or cached_otp != data["otp"]:
+            return Response({"detail": "OTP invalid or expired."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user, _ = User.objects.get_or_create(
+            phone_num=phone_num,
+            defaults={"username": data["username"]},
+        )
+        user.username = data["username"]
+        user.set_password(data["password"])
+        user.save()
+
+        account, created = Account.objects.get_or_create(
+            user=user,
+            defaults={
+                "fname": data["fname"],
+                "lname": data["lname"],
+                "passport_id": data["passport_id"],
+                "balance": Decimal("0"),
+            },
+        )
+        if not created:
+            return Response({"detail": "Account already exists."}, status=status.HTTP_400_BAD_REQUEST)
+
+        cache.delete(f"otp:{phone_num}")
+        cache.delete(f"exists:phone:{phone_num}")
+        refresh = RefreshToken.for_user(user)
+        return Response(
+            {
+                "account": AccountSerializer(account).data,
+                "tokens": {"refresh": str(refresh), "access": str(refresh.access_token)},
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AddCardView(generics.CreateAPIView):
+    serializer_class = CardSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            account = request.user.account
+        except Account.DoesNotExist:
+            return Response({"detail": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        card = serializer.save(account=account, balance=Decimal("0"))
+        cache.delete(f"exists:card:{card.card_id}")
+        return Response(CardSerializer(card).data, status=status.HTTP_201_CREATED)
+
+
+class CheckIfAccountExistsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        try:
-            refresh_token = request.data["refresh"]
-            token = RefreshToken(refresh_token)
-            token.blacklist()
-            return Response(
-                {"detail": "Logout successful"},
-                status=status.HTTP_205_RESET_CONTENT
-            )
-        except Exception:
-            return Response(
-                {"detail": "Invalid token"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        serializer = CheckExistsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone_num = serializer.validated_data.get("phone_num")
+        card_id = serializer.validated_data.get("card_id")
+        response = {}
+
+        if phone_num:
+            phone_key = f"exists:phone:{phone_num}"
+            account_exists = cache.get(phone_key)
+            if account_exists is None:
+                account_exists = Account.objects.filter(user__phone_num=phone_num).exists()
+                cache.set(phone_key, account_exists, EXISTS_TTL_SECONDS)
+            response["account_exists"] = account_exists
+
+        if card_id:
+            card_key = f"exists:card:{card_id}"
+            card_exists = cache.get(card_key)
+            if card_exists is None:
+                card_exists = Card.objects.filter(card_id=card_id).exists()
+                cache.set(card_key, card_exists, EXISTS_TTL_SECONDS)
+            response["card_exists"] = card_exists
+
+        return Response(response, status=status.HTTP_200_OK)
 
 
-
-class UserProfileView(generics.RetrieveUpdateAPIView):
-    permission_classes = [IsAuthenticated]
-    serializer_class = UserProfileSerializer
-    
-    def get_object(self):
-        return Account.objects.get(user=self.request.user)
-    
-    def retrieve(self, request, *args, **kwargs):
-        account = self.get_object()
-        serializer = self.get_serializer(account)
-        
-        return Response({
-            'user': {
-                'id': request.user.id,
-                'username': request.user.username,
-                'first_name': request.user.first_name,
-                'last_name': request.user.last_name,
-                'phone': request.user.phone,
-                'email': request.user.email,
-            },
-            'account': serializer.data
-        }, status=status.HTTP_200_OK)
-    
-    def update(self, request, *args, **kwargs):
-        account = self.get_object()
-        user = request.user
-        
-        if 'first_name' in request.data:
-            user.first_name = request.data.get('first_name')
-        if 'last_name' in request.data:
-            user.last_name = request.data.get('last_name')
-        if 'phone' in request.data:
-            user.phone = request.data.get('phone')
-        if 'email' in request.data:
-            user.email = request.data.get('email')
-        user.save()
-        
-        if 'first_name' in request.data:
-            account.first_name = request.data.get('first_name')
-        if 'last_name' in request.data:
-            account.last_name = request.data.get('last_name')
-        account.save()
-        
-        serializer = self.get_serializer(account)
-        
-        return Response({
-            'message': 'Профиль успешно обновлен',
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'phone': user.phone,
-                'email': user.email,
-            },
-            'account': serializer.data
-        }, status=status.HTTP_200_OK)
-
-
-
-class AccountListCreateView(generics.ListCreateAPIView):
-    serializer_class = AccountSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [OrderingFilter]
-    ordering_fields = ['id', 'balance', 'first_name', 'last_name']
-    ordering = ['-id']
-    
-    def get_queryset(self):
-        return Account.objects.filter(user=self.request.user)
-    
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            'count': queryset.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
-
-
-class AccountDetailView(generics.RetrieveUpdateDestroyAPIView):
-    serializer_class = AccountSerializer
-    permission_classes = [IsAuthenticated]
-    lookup_field = 'id'
-    
-    def get_queryset(self):
-        return Account.objects.filter(user=self.request.user)
-    
-    def destroy(self, request, *args, **kwargs):
-        account = self.get_object()
-        
-        if account.cards.exists():
-            return Response({
-                'error': 'Невозможно удалить счет с активными картами'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        account.delete()
-        return Response({
-            'message': 'Счет успешно удален'
-        }, status=status.HTTP_204_NO_CONTENT)
-
-
-class AccountTotalBalanceView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        accounts = Account.objects.filter(user=request.user)
-        total = accounts.aggregate(total=Sum('balance'))['total'] or 0
-        
-        return Response({
-            'total_balance': total,
-            'accounts_count': accounts.count()
-        }, status=status.HTTP_200_OK)
-
-
-class AccountTopUpView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
-    def post(self, request, id):
-        try:
-            account = Account.objects.get(id=id, user=request.user)
-        except Account.DoesNotExist:
-            return Response({
-                'error': 'Счет не найден'
-            }, status=status.HTTP_404_NOT_FOUND)
-        
-        amount = request.data.get('amount')
-        if not amount:
-            return Response({
-                'error': 'Необходимо указать сумму'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        try:
-            amount = int(amount)
-        except ValueError:
-            return Response({
-                'error': 'Сумма должна быть числом'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        if amount <= 0:
-            return Response({
-                'error': 'Сумма должна быть больше 0'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        if amount > 1000000:
-            return Response({
-                'error': 'Максимальная сумма пополнения 1,000,000 сомов'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        old_balance = account.balance
-        account.balance += amount
-        account.save()
-        
-        return Response({
-            'message': 'Счет успешно пополнен',
-            'account_id': account.id,
-            'old_balance': old_balance,
-            'new_balance': account.balance,
-            'amount': amount
-        }, status=status.HTTP_200_OK)
-
-
-
-class CardListView(generics.ListAPIView):
-    serializer_class = CardSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [OrderingFilter]
-    filterset_fields = ['account']
-    ordering_fields = ['id', 'balance', 'account']
-    ordering = ['-id']
-    
-    def get_queryset(self):
-        return Card.objects.filter(account__user=self.request.user)
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            'count': queryset.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
-
-
-class CardCreateView(generics.CreateAPIView):
-    permission_classes = [IsAuthenticated]
-    serializer_class = None
+class TransactionView(generics.CreateAPIView):
+    serializer_class = TransactionSerializer
+    permission_classes = [permissions.IsAuthenticated]
 
     def create(self, request, *args, **kwargs):
-        try:
-            account = Account.objects.get(user=request.user)
-        except Account.DoesNotExist:
-            return Response(
-                {'error': 'У вас нет счета'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if Card.objects.filter(account=account).count() >= 3:
-            return Response(
-                {'error': 'Нельзя выпустить более 3 карт на один счет'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        card = Card.objects.create(
-            account=account,
-            card_num=secrets.token_urlsafe(16),
-            balance=account.balance
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        sender = serializer.validated_data["sender"]
+        reciver = serializer.validated_data["reciver"]
+        amount = serializer.validated_data["amount"]
+
+        if sender.user != request.user:
+            return Response({"detail": "Sender must be your account."}, status=status.HTTP_403_FORBIDDEN)
+        if sender.balance < amount:
+            return Response({"detail": "Insufficient sender balance."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sender.balance -= amount
+        reciver.balance += amount
+        sender.save(update_fields=["balance"])
+        reciver.save(update_fields=["balance"])
+
+        txn = serializer.save(
+            cuur_balance_sender=sender.balance,
+            cuur_balance_reciver=reciver.balance,
+            status="success",
         )
-        
-        serializer = self.get_serializer(card)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        invalidate_history_cache(sender.user_id)
+        if reciver.user_id != sender.user_id:
+            invalidate_history_cache(reciver.user_id)
+        return Response(TransactionSerializer(txn).data, status=status.HTTP_201_CREATED)
 
 
+class TransactionInsideView(generics.CreateAPIView):
+    serializer_class = TransactionInsideSerializer
+    permission_classes = [permissions.IsAuthenticated]
 
-class CardDetailView(generics.RetrieveDestroyAPIView):
-    serializer_class = CardSerializer
-    permission_classes = [IsAuthenticated]
-    
-    def get_queryset(self):
-        return Card.objects.filter(account__user=self.request.user)
-    
-    def destroy(self, request, *args, **kwargs):
-        card = self.get_object()
-        if card.deposites.exists():
-            return Response({
-                'error': 'Невозможно удалить карту с активными депозитами'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        card.delete()
-        return Response({
-            'message': 'Карта успешно удалена'
-        }, status=status.HTTP_204_NO_CONTENT)
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tx_type = serializer.validated_data["type"]
+        sender_ref = serializer.validated_data["sender"]
+        reciver_ref = serializer.validated_data["reciver"]
+        amount = serializer.validated_data["amount"]
 
+        if tx_type == "phone_num":
+            try:
+                sender_account = Account.objects.get(user__phone_num=sender_ref)
+                reciver_account = Account.objects.get(user__phone_num=reciver_ref)
+            except Account.DoesNotExist:
+                return Response({"detail": "Sender or receiver phone account not found."}, status=status.HTTP_404_NOT_FOUND)
+            if sender_account.user != request.user:
+                return Response({"detail": "Sender phone must be yours."}, status=status.HTTP_403_FORBIDDEN)
+            sender_balance = sender_account.balance
+            reciver_balance = reciver_account.balance
+            if sender_balance < amount:
+                return Response({"detail": "Insufficient sender balance."}, status=status.HTTP_400_BAD_REQUEST)
+            sender_account.balance -= amount
+            reciver_account.balance += amount
+            sender_account.save(update_fields=["balance"])
+            reciver_account.save(update_fields=["balance"])
+            sender_balance = sender_account.balance
+            reciver_balance = reciver_account.balance
+            invalidate_history_cache(sender_account.user_id)
+            invalidate_history_cache(reciver_account.user_id)
+        else:
+            try:
+                sender_card = Card.objects.get(card_id=sender_ref)
+                reciver_card = Card.objects.get(card_id=reciver_ref)
+            except Card.DoesNotExist:
+                return Response({"detail": "Sender or receiver card not found."}, status=status.HTTP_404_NOT_FOUND)
+            if sender_card.account.user != request.user:
+                return Response({"detail": "Sender card must be yours."}, status=status.HTTP_403_FORBIDDEN)
+            if sender_card.balance < amount:
+                return Response({"detail": "Insufficient sender balance."}, status=status.HTTP_400_BAD_REQUEST)
+            sender_card.balance -= amount
+            reciver_card.balance += amount
+            sender_card.save(update_fields=["balance"])
+            reciver_card.save(update_fields=["balance"])
+            sender_balance = sender_card.balance
+            reciver_balance = reciver_card.balance
+            invalidate_history_cache(sender_card.account.user_id)
+            invalidate_history_cache(reciver_card.account.user_id)
 
-class CardBalanceView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request, card_num):
-        try:
-            card = Card.objects.get(card_num=card_num, account__user=request.user)
-        except Card.DoesNotExist:
-            return Response({
-                'error': 'Карта не найдена'
-            }, status=status.HTTP_404_NOT_FOUND)
-        
-        return Response({
-            'card_num': card.card_num,
-            'balance': card.account.balance,
-            'account_id': card.account.id,
-        }, status=status.HTTP_200_OK)
-
-
-class CardBlockView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
-    def destroy(self, request, id):
-        try:
-            card = Card.objects.get(id=id, account__user=request.user)
-        except Card.DoesNotExist:
-            return Response({
-                'error': 'Карта не найдена'
-            }, status=status.HTTP_404_NOT_FOUND)
-        
-        card.delete()
-        
-        return Response({
-            'message': 'Карта успешно заблокирована',
-        }, status=status.HTTP_200_OK)
-
-
-
-class TransactionListCreateView(generics.ListCreateAPIView):
-    serializer_class = TransactionSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [OrderingFilter]
-    filterset_fields = ['account_from', 'account_to', 'type']
-    ordering_fields = ['created_at', 'amount']
-    ordering = ['-created_at']
-    
-    def get_queryset(self):
-        return Transactions.objects.filter(
-            Q(account_from__user=self.request.user) |
-            Q(account_to__user=self.request.user)
-        ).order_by('-created_at')
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        trans_type = request.query_params.get('type')
-        if trans_type:
-            queryset = queryset.filter(type=trans_type)
-        
-        account_from = request.query_params.get('account_from')
-        if account_from:
-            queryset = queryset.filter(account_from_id=account_from)
-        
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            'count': queryset.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
-    
-    def perform_create(self, serializer):
-       account = Account.objects.get(user=self.request.user)
-       serializer.save(account_from=account)
-
-class TransactionDetailView(generics.RetrieveAPIView):
-    serializer_class = TransactionSerializer
-    permission_classes = [IsAuthenticated]
-    
-    def get_queryset(self):
-        return Transactions.objects.filter(
-            Q(account_from__user=self.request.user) |
-            Q(account_to__user=self.request.user)
+        inside_tx = serializer.save(
+            cuur_balance_sender=sender_balance,
+            cuur_balance_reciver=reciver_balance,
+            status="success",
         )
-    
+        return Response(TransactionInsideSerializer(inside_tx).data, status=status.HTTP_201_CREATED)
 
 
-class MyTransactionsView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
+class GetCreditView(generics.CreateAPIView):
+    serializer_class = CreditSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            card = Card.objects.get(card_id=serializer.validated_data["card_id"])
+        except Card.DoesNotExist:
+            return Response({"detail": "Card not found."}, status=status.HTTP_404_NOT_FOUND)
+        if card.account.user != request.user:
+            return Response({"detail": "Card must be yours."}, status=status.HTTP_403_FORBIDDEN)
+        if card.cart_name != "credit":
+            return Response({"detail": "Credit can be issued only for credit card type."}, status=status.HTTP_400_BAD_REQUEST)
+        card.balance += serializer.validated_data["amount"]
+        card.save(update_fields=["balance"])
+        credit = Credit.objects.create(
+            card=card,
+            amount=serializer.validated_data["amount"],
+            procent=serializer.validated_data["procent"],
+            status="success",
+        )
+        invalidate_history_cache(request.user.id)
+        return Response(CreditSerializer(credit).data, status=status.HTTP_201_CREATED)
+
+
+class PutDepositView(generics.CreateAPIView):
+    serializer_class = DepositSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            card = Card.objects.get(card_id=serializer.validated_data["card_id"])
+        except Card.DoesNotExist:
+            return Response({"detail": "Card not found."}, status=status.HTTP_404_NOT_FOUND)
+        if card.account.user != request.user:
+            return Response({"detail": "Card must be yours."}, status=status.HTTP_403_FORBIDDEN)
+        if card.balance < serializer.validated_data["amount"]:
+            return Response({"detail": "Insufficient card balance."}, status=status.HTTP_400_BAD_REQUEST)
+        card.balance -= serializer.validated_data["amount"]
+        card.save(update_fields=["balance"])
+        deposit = Deposit.objects.create(
+            card=card,
+            amount=serializer.validated_data["amount"],
+            procent=serializer.validated_data["procent"],
+            status="success",
+        )
+        invalidate_history_cache(request.user.id)
+        return Response(DepositSerializer(deposit).data, status=status.HTTP_201_CREATED)
+
+
+class HistoryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
     def get(self, request):
-        account = Account.objects.get(user=request.user)
-        
-        transactions_from = Transactions.objects.filter(account_from=account)
-        transactions_to = Transactions.objects.filter(account_to=account)
-        
-        all_transactions = (transactions_from | transactions_to).order_by('-created_at')
-        
-        serializer = TransactionSerializer(all_transactions, many=True)
-        return Response({
-            'count': all_transactions.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
+        key = history_cache_key(request.user.id, request.query_params)
+        cached = cache.get(key)
+        if cached is not None:
+            return Response({"source": "cache", "transaction_history": cached}, status=status.HTTP_200_OK)
 
+        account = request.user.account
+        tx_qs = Transaction.objects.filter(Q(sender=account) | Q(reciver=account)).order_by("-created_at")
+        inside_qs = TransactionInside.objects.none()
 
-class TransactionStatisticsView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        account = Account.objects.get(user=request.user)
-        
-        transactions_from = Transactions.objects.filter(account_from=account)
-        transactions_to = Transactions.objects.filter(account_to=account)
-        
-        total_income = transactions_to.aggregate(total=Sum('amount'))['total'] or 0
-        total_outcome = transactions_from.aggregate(total=Sum('amount'))['total'] or 0
-        
-        stats = {
-            'total_transactions': transactions_from.count() + transactions_to.count(),
-            'total_income': total_income,
-            'total_outcome': total_outcome,
-            'balance': account.balance,
-            'by_type': {
-                'to_account': transactions_to.filter(type='to_account').count(),
-                'to_card': transactions_to.filter(type='to_card').count(),
-                'from_card': transactions_from.filter(type='from_card').count(),
-                'from_account': transactions_from.filter(type='from_account').count(),
-            }
+        card_filter = request.query_params.get("card")
+        if card_filter:
+            own_cards = Card.objects.filter(account=account, card_id=card_filter)
+            if own_cards.exists():
+                inside_qs = TransactionInside.objects.filter(Q(sender=card_filter) | Q(reciver=card_filter))
+            else:
+                tx_qs = tx_qs.none()
+
+        direction = request.query_params.get("income_and_pays")
+        if direction == "income":
+            tx_qs = tx_qs.filter(reciver=account)
+        elif direction == "pays":
+            tx_qs = tx_qs.filter(sender=account)
+
+        if request.query_params.get("inside") in ("1", "true", "True"):
+            if not inside_qs.exists():
+                phone = request.user.phone_num
+                card_ids = list(Card.objects.filter(account=account).values_list("card_id", flat=True))
+                inside_qs = TransactionInside.objects.filter(
+                    Q(sender=phone)
+                    | Q(reciver=phone)
+                    | Q(sender__in=card_ids)
+                    | Q(reciver__in=card_ids)
+                ).order_by("-created_at")
+
+        date_from = request.query_params.get("time")
+        if date_from:
+            tx_qs = tx_qs.filter(created_at__date__gte=date_from)
+            inside_qs = inside_qs.filter(created_at__date__gte=date_from)
+
+        data = {
+            "transactions": TransactionSerializer(tx_qs, many=True).data,
+            "inside_transactions": TransactionInsideSerializer(inside_qs, many=True).data,
         }
-        
-        return Response(stats, status=status.HTTP_200_OK)
+        cache.set(key, data, HISTORY_TTL_SECONDS)
+        return Response({"source": "db", "transaction_history": data}, status=status.HTTP_200_OK)
 
 
+class AccountBlackListView(generics.CreateAPIView):
+    serializer_class = AccountBlackListSerializer
+    permission_classes = [permissions.IsAdminUser]
 
-class DepositListCreateView(generics.ListCreateAPIView):
-    serializer_class = DepositeSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [OrderingFilter]
-    filterset_fields = ['card']
-    ordering_fields = ['created_at', 'amount', 'procent']
-    ordering = ['-created_at']
-    
-    def get_queryset(self):
-        return Deposite.objects.filter(card__account__user=self.request.user)
-    
     def perform_create(self, serializer):
-        card_id = self.request.data.get('card')
-        
-        try:
-            card = Card.objects.get(id=card_id, account__user=self.request.user)
-        except Card.DoesNotExist:
-            raise ValidationError({'card': 'Карта не найдена или вы не владеете ей'})
-        
-        serializer.save(card=card)
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        card_id = request.query_params.get('card')
-        
-        if card_id:
-            queryset = queryset.filter(card_id=card_id)
-        
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            'count': queryset.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
+        instance = serializer.save()
+        set_blacklist_cache_for_account(instance.account_id, True)
 
 
-class DepositDetailView(generics.RetrieveDestroyAPIView):
-    serializer_class = DepositeSerializer
-    permission_classes = [IsAuthenticated]
-    lookup_field = 'id'
-    
-    def get_queryset(self):
-        return Deposite.objects.filter(card__account__user=self.request.user)
-    
-    def destroy(self, request, *args, **kwargs):
-        deposit = self.get_object()
-        weeks_passed = (timezone.now() - deposit.created_at).days // 7
-        
-        total = deposit.amount
-        for _ in range(weeks_passed):
-            total += total * (deposit.procent / 100)
-        deposit.card.balance += int(total)
-        deposit.card.save()
-        
-        deposit.delete()
-        return Response({
-            'message': f'Депозит закрыт. Получено: {int(total)} сомов',
-            'initial_amount': deposit.amount,
-            'earned': int(total - deposit.amount),
-            'total_received': int(total)
-        }, status=status.HTTP_200_OK)
+class CardBlackListView(generics.CreateAPIView):
+    serializer_class = CardBlackListSerializer
+    permission_classes = [permissions.IsAdminUser]
 
-
-class MyDepositsView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        account = Account.objects.get(user=request.user)
-        deposits = Deposite.objects.filter(card__account=account).order_by('-created_at')
-        
-        serializer = DepositeSerializer(deposits, many=True)
-        return Response({
-            'count': deposits.count(),
-            'total_in_deposits': sum(d.amount for d in deposits),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
-
-
-class CreditListCreateView(generics.ListCreateAPIView):
-    serializer_class = CreditSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [OrderingFilter]
-    filterset_fields = ['card']
-    ordering_fields = ['created_at', 'amount', 'procent']
-    ordering = ['-created_at']
-    
-    def get_queryset(self):
-        return Credit.objects.filter(card__account__user=self.request.user)
-    
     def perform_create(self, serializer):
-        card_id = self.request.data.get('card')
-        try:
-            card = Card.objects.select_for_update().get(id=card_id, account__user=self.request.user)
-        except Card.DoesNotExist:
-            raise ValidationError({'card': 'Карта не найдена или вы не владеете ей'})
-        
-        amount = self.request.data.get('amount')
-        card.balance += int(amount)
-        card.save()
-        
-        serializer.save(card=card)
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        card_id = request.query_params.get('card')
-        
-        if card_id:
-            queryset = queryset.filter(card_id=card_id)
-        
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            'count': queryset.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
+        instance = serializer.save()
+        set_blacklist_cache_for_card(instance.card_id, True)
 
 
-class CreditDetailView(generics.RetrieveDestroyAPIView):
-    serializer_class = CreditSerializer
-    permission_classes = [IsAuthenticated]
-    
-    def get_queryset(self):
-        return Credit.objects.filter(card__account__user=self.request.user)
-    
-    def destroy(self, request, *args, **kwargs):
-        credit = self.get_object()
-        
-        weeks_passed = (timezone.now() - credit.created_at).days // 7
-        debt = credit.amount
-        for _ in range(weeks_passed):
-            debt += debt * (credit.procent / 100)
-        debt = int(debt)
-        
-        card = credit.card
-        
-        if card.balance < debt:
-            return Response({
-                'error': f'Недостаточно средств для погашения кредита. Нужно: {debt}, доступно: {card.balance}',
-                'debt': debt,
-                'balance': card.balance
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        card.balance -= debt
-        card.save()
-        
-        credit_amount = credit.amount
-        
-        credit.delete()
-        
-        return Response({
-            'message': f'Кредит успешно погашен. Сумма: {debt} сомов',
-            'initial_amount': credit_amount,
-            'paid': debt,
-            'overpayment': debt - credit_amount
-        }, status=status.HTTP_200_OK)
+class BlackListCheckView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
-
-class MyCreditsView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
-        account = Account.objects.get(user=request.user)
-        credits = Credit.objects.filter(card__account=account).order_by('-created_at')
-        
-        total_debt = 0
-        results = []
-        
-        for credit in credits:
-            if not credit.is_closed:
-                weeks_passed = (timezone.now() - credit.created_at).days // 7
-                debt = credit.amount
-                for _ in range(weeks_passed):
-                    debt += debt * (credit.procent / 100)
-                total_debt += int(debt)
-            
-            results.append({
-                'id': credit.id,
-                'card_number': f"****-****-****-{str(credit.card.card_num)[-4:]}",
-                'initial_amount': credit.amount,
-                'procent': credit.procent,
-                'created_at': credit.created_at,
-                'is_closed': credit.is_closed,
-                'current_debt': int(debt) if not credit.is_closed else 0
-            })
-        
-        return Response({
-            'count': credits.count(),
-            'total_debt': total_debt,
-            'results': results
-        }, status=status.HTTP_200_OK)
+        account_id = request.query_params.get("account")
+        card_id = request.query_params.get("card")
+        payload = {}
+
+        if account_id:
+            key = f"blacklist:account:{account_id}"
+            is_blacklisted = cache.get(key)
+            if is_blacklisted is None:
+                is_blacklisted = AccountBlackList.objects.filter(account_id=account_id).exists()
+                cache.set(key, is_blacklisted, BLACKLIST_TTL_SECONDS)
+            payload["account_blacklisted"] = is_blacklisted
+
+        if card_id:
+            key = f"blacklist:card:{card_id}"
+            is_blacklisted = cache.get(key)
+            if is_blacklisted is None:
+                is_blacklisted = CardBlackList.objects.filter(card__card_id=card_id).exists()
+                cache.set(key, is_blacklisted, BLACKLIST_TTL_SECONDS)
+            payload["card_blacklisted"] = is_blacklisted
+
+        return Response(payload, status=status.HTTP_200_OK)
 
 
-class CardToCardTransferView(generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
+class AdminAccountViewSet(viewsets.ModelViewSet):
+    queryset = Account.objects.all().order_by("-id")
+    serializer_class = AccountSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminCardViewSet(viewsets.ModelViewSet):
+    queryset = Card.objects.all().order_by("-id")
+    serializer_class = CardSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminTransactionViewSet(viewsets.ModelViewSet):
+    queryset = Transaction.objects.all().order_by("-created_at")
     serializer_class = TransactionSerializer
-    
-    def post(self, request):
-        from_card_num = request.data.get('from_card_num')
-        to_account = request.data.get('to_account')
-        amount = request.data.get('amount')
-        description = request.data.get('description', '')
-        
-        try:
-            from_card = Card.objects.select_for_update().get(
-                card_num=from_card_num, 
-                account__user=request.user
-            )
-            account = Account.objects.get(id=to_account)
-        except Account.DoesNotExist:
-            return Response({
-                'error': 'Аккаунт не найдена'
-            }, status=status.HTTP_404_NOT_FOUND)
-        
-        amount = int(amount)
-        
-        if from_card.balance < amount:
-            return Response({
-                'error': 'Недостаточно средств на балансе'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        from_card.balance -= amount
-        account.balance += amount
-        from_card.save()
-        account.save()
-        
-        transaction = Transactions.objects.create(
-            account_from=from_card.account,
-            account_to=account,
-            amount=amount,
-            type='from_card_to_account',
-            description=description,
-            current_balance_acc_from=from_card.balance,
-            current_balance_acc_to=account.balance
-        )
-        
-        return Response({
-            'message': 'Перевод успешно выполнен',
-            'from_card': from_card.account.first_name,
-            'to_card': account.first_name,
-            'amount': amount,
-            'transaction_id': transaction.id
-        }, status=status.HTTP_200_OK)
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminTransactionInsideViewSet(viewsets.ModelViewSet):
+    queryset = TransactionInside.objects.all().order_by("-created_at")
+    serializer_class = TransactionInsideSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminCreditViewSet(viewsets.ModelViewSet):
+    queryset = Credit.objects.all().order_by("-created_at")
+    serializer_class = CreditSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminDepositViewSet(viewsets.ModelViewSet):
+    queryset = Deposit.objects.all().order_by("-created_at")
+    serializer_class = DepositSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminAccountBlackListViewSet(viewsets.ModelViewSet):
+    queryset = AccountBlackList.objects.all().order_by("-created_at")
+    serializer_class = AccountBlackListSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+
+class AdminCardBlackListViewSet(viewsets.ModelViewSet):
+    queryset = CardBlackList.objects.all().order_by("-created_at")
+    serializer_class = CardBlackListSerializer
+    permission_classes = [permissions.IsAdminUser]

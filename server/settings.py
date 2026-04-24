@@ -42,7 +42,6 @@ INSTALLED_APPS = [
     'app',
     'drf_yasg',
     'rest_framework_simplejwt.token_blacklist',
-    
 ]
 
 AUTH_USER_MODEL = 'app.User'
@@ -144,6 +143,13 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+}
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+    }
 }
 
 from datetime import timedelta
